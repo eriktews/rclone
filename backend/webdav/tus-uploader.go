@@ -106,6 +106,11 @@ func (u *Uploader) uploadChunk(ctx context.Context, body io.Reader, size int64, 
 
 // Upload uploads the entire body to the server.
 func (u *Uploader) Upload(ctx context.Context, options ...fs.OpenOption) error {
+	// Close the notification channel when the upload is finished so the
+	// broadcastProgress goroutine exits. Otherwise it would wait on this
+	// channel forever, retaining the Uploader and the uploaded data in
+	// memory.
+	defer close(u.notifyChan)
 	cnt := 1
 
 	fs.Debug(u.fs, "Uploaded starts")
