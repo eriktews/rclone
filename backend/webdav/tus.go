@@ -7,9 +7,11 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 
@@ -33,7 +35,7 @@ func (o *Object) updateViaTus(ctx context.Context, in io.Reader, contentType str
 	upload := NewUpload(in, src.Size(), metadata, fingerprint)
 
 	// create the uploader.
-	uploader, err := o.CreateUploader(ctx, upload, options...)
+	uploader, err := o.CreateUploader(ctx, src, upload, options...)
 	if err == nil {
 		// start the uploading process.
 		err = uploader.Upload(ctx, options...)
@@ -63,9 +65,18 @@ func (f *Fs) getTusLocationOrRetry(ctx context.Context, resp *http.Response, err
 }
 
 // CreateUploader creates a new upload to the server.
-func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.OpenOption) (*Uploader, error) {
+//
+// The upload is created with the metadata of src so the creation
+// request does not need to read the destination object.
+func (o *Object) CreateUploader(ctx context.Context, src fs.ObjectInfo, u *Upload, options ...fs.OpenOption) (*Uploader, error) {
 	if u == nil {
 		return nil, ErrNilUpload
+	}
+	if u.size < 0 {
+		return nil, errors.New("tus upload: can't upload a stream of unknown size")
+	}
+	if u.size > 0 && o.fs.opt.ChunkSize <= 0 {
+		return nil, ErrChunkSize
 	}
 
 	// if c.Config.Resume && len(u.Fingerprint) == 0 {
@@ -86,7 +97,7 @@ func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.Op
 		NoResponse:    true,
 		RootURL:       o.fs.endpointURL,
 		ContentLength: &l,
-		ExtraHeaders:  o.extraHeaders(ctx, o),
+		ExtraHeaders:  o.extraHeaders(ctx, src),
 		Options:       options,
 	}
 	opts.ExtraHeaders["Upload-Length"] = strconv.FormatInt(u.size, 10)
@@ -96,7 +107,7 @@ func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.Op
 
 	var tusLocation string
 	// rclone http call
-	err := o.fs.pacer.CallNoRetry(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
 		var retry bool
 		res, err := o.fs.srv.Call(ctx, &opts)
 		retry, tusLocation, err = o.fs.getTusLocationOrRetry(ctx, res, err)
@@ -105,6 +116,37 @@ func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.Op
 	if err != nil {
 		return nil, fmt.Errorf("making upload directory failed: %w", err)
 	}
+	if tusLocation == "" {
+		return nil, errors.New("tus upload: server did not return an upload location")
+	}
+	loc, err := url.Parse(tusLocation)
+	if err != nil {
+		return nil, fmt.Errorf("tus upload: invalid upload location %q: %w", tusLocation, err)
+	}
+	if loc.Opaque != "" || (loc.Scheme != "" && loc.Host == "") {
+		return nil, fmt.Errorf("tus upload: invalid upload location %q", tusLocation)
+	}
+	base, err := url.Parse(o.fs.endpointURL)
+	if err != nil {
+		return nil, fmt.Errorf("tus upload: invalid endpoint URL %q: %w", o.fs.endpointURL, err)
+	}
+	// Resolve relative locations against the URL the upload was created
+	// at, which may be a subdirectory of the endpoint.
+	reqURL, err := rest.URLJoin(base, dir)
+	if err != nil {
+		return nil, fmt.Errorf("tus upload: invalid upload directory %q: %w", dir, err)
+	}
+	resolved := reqURL.ResolveReference(loc)
+	if resolved.Scheme == "" || resolved.Host == "" {
+		return nil, fmt.Errorf("tus upload: invalid upload location %q", tusLocation)
+	}
+	if base.Scheme == "https" && resolved.Scheme != "https" {
+		return nil, rest.ErrHTTPSDowngrade
+	}
+	if !rest.SameHost(base, resolved) {
+		return nil, fmt.Errorf("tus upload: upload location %q is not on the endpoint host %q", resolved.Redacted(), base.Redacted())
+	}
+	tusLocation = resolved.String()
 
 	uploader := NewUploader(o.fs, tusLocation, u, 0)
 

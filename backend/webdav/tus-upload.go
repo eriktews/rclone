@@ -1,7 +1,6 @@
 package webdav
 
 import (
-	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -13,7 +12,10 @@ type Metadata map[string]string
 
 // Upload is a struct containing the file status during upload
 type Upload struct {
-	stream io.ReadSeeker
+	// stream is read sequentially, one chunk at a time. It is never
+	// rewound: the tus offset advances with every accepted PATCH and
+	// resuming a previous upload is not implemented.
+	stream io.Reader
 	size   int64
 	offset int64
 
@@ -62,24 +64,16 @@ func b64encode(s string) string {
 }
 
 // NewUpload creates a new upload from an io.Reader.
+//
+// The reader is consumed sequentially in chunk sized pieces, so it does
+// not need to implement io.Seeker.
 func NewUpload(reader io.Reader, size int64, metadata Metadata, fingerprint string) *Upload {
-	stream, ok := reader.(io.ReadSeeker)
-
-	if !ok {
-		buf := new(bytes.Buffer)
-		_, err := buf.ReadFrom(reader)
-		if err != nil {
-			return nil
-		}
-		stream = bytes.NewReader(buf.Bytes())
-	}
-
 	if metadata == nil {
 		metadata = make(Metadata)
 	}
 
 	return &Upload{
-		stream: stream,
+		stream: reader,
 		size:   size,
 
 		Fingerprint: fingerprint,
