@@ -11,6 +11,7 @@ package webdav
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,35 +42,54 @@ type nonSeekable struct {
 func (n *nonSeekable) Read(p []byte) (int, error) { return n.r.Read(p) }
 
 // fakeTusServer implements the small part of the tus protocol that the
-// webdav backend uses: POST to create an upload, PATCH to append chunks.
-// It records the bytes received per upload so tests can check them.
+// webdav backend uses: POST to create an upload, PATCH to append chunks
+// and HEAD to ask for the offset of an upload. It records the bytes
+// received per upload so tests can check them.
 type fakeTusServer struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	data   map[string][]byte
-	nextID int
+	srv *httptest.Server
+	mu  sync.Mutex
+	// retainData controls whether received data is kept for inspection.
+	retainData bool
+	data       map[string][]byte
+	total      map[string]int64
+	nextID     int
+	// When blockRelease is set, the first PATCH of each upload blocks
+	// until it is closed, and patchArrived is closed when that happens.
+	blockRelease chan struct{}
+	patchArrived chan struct{}
+	arrivedOnce  sync.Once
+	// dropResponseBeforeAccept is the number of incoming PATCH requests
+	// whose connection is closed before accepting the body.
+	dropResponseBeforeAccept int
+	// acceptPrefix is the number of bytes of the body which the server
+	// accepts of the first PATCH of an upload. The rest of the body is
+	// discarded and the new offset is reported, which is what a server
+	// may do when it does not accept a whole chunk.
+	acceptPrefix int
+	// redirectFirstPatch makes the server answer the first PATCH with a
+	// 307 redirect to the same URL.
+	redirectFirstPatch bool
+	// redirected records whether the first PATCH was redirected.
+	redirected bool
+	// patches is the number of PATCH requests received.
+	patches int
 }
 
 func newFakeTusServer() *fakeTusServer {
-	f := &fakeTusServer{data: make(map[string][]byte)}
+	f := &fakeTusServer{
+		retainData: true,
+		data:       make(map[string][]byte),
+		total:      make(map[string]int64),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
 		switch r.Method {
 		case "POST":
-			f.nextID++
-			w.Header().Set("Location", fmt.Sprintf("http://%s/tus/upload-%d", r.Host, f.nextID))
-			w.WriteHeader(http.StatusCreated)
+			f.handlePost(w, r)
 		case "PATCH":
-			buf, err := io.ReadAll(r.Body)
-			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			f.data[r.URL.Path] = append(f.data[r.URL.Path], buf...)
-			w.Header().Set("Upload-Offset", strconv.Itoa(len(f.data[r.URL.Path])))
-			w.WriteHeader(http.StatusNoContent)
+			f.handlePatch(w, r)
+		case "HEAD":
+			f.handleHead(w, r)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -78,10 +98,98 @@ func newFakeTusServer() *fakeTusServer {
 	return f
 }
 
+func (f *fakeTusServer) handlePost(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	w.Header().Set("Location", fmt.Sprintf("http://%s/tus/upload-%d", r.Host, f.nextID))
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (f *fakeTusServer) handleHead(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	off := f.total[r.URL.Path]
+	f.mu.Unlock()
+	w.Header().Set("Upload-Offset", strconv.FormatInt(off, 10))
+	w.WriteHeader(http.StatusOK)
+}
+
+// dropConnection closes the connection of the request without answering
+// it, which is what a server does when it loses the response.
+func dropConnection(w http.ResponseWriter) {
+	if hj, ok := w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func (f *fakeTusServer) handlePatch(w http.ResponseWriter, r *http.Request) {
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	requestedOffset, err := strconv.ParseInt(r.Header.Get("Upload-Offset"), 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// The handler must not hold the mutex while it blocks.
+	f.mu.Lock()
+	f.patches++
+	if f.redirectFirstPatch && !f.redirected {
+		f.redirected = true
+		f.mu.Unlock()
+		// Answer with a redirect so the client has to send the body again.
+		w.Header().Set("Location", r.URL.RequestURI())
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		return
+	}
+	if f.dropResponseBeforeAccept > 0 {
+		f.dropResponseBeforeAccept--
+		f.mu.Unlock()
+		dropConnection(w)
+		return
+	}
+	if requestedOffset != f.total[r.URL.Path] {
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	first := f.total[r.URL.Path] == 0
+	accept := buf
+	if first && f.acceptPrefix > 0 && len(accept) > f.acceptPrefix {
+		accept = accept[:f.acceptPrefix]
+	}
+	f.total[r.URL.Path] += int64(len(accept))
+	if f.retainData {
+		f.data[r.URL.Path] = append(f.data[r.URL.Path], accept...)
+	}
+	newOffset := f.total[r.URL.Path]
+	f.mu.Unlock()
+
+	if first && f.blockRelease != nil {
+		f.arrivedOnce.Do(func() { close(f.patchArrived) })
+		<-f.blockRelease
+	}
+
+	w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (f *fakeTusServer) received(path string) []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.data[path]
+}
+
+// patchCount returns the number of PATCH requests received.
+func (f *fakeTusServer) patchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.patches
 }
 
 // release drops the data kept by the server so it does not count
@@ -327,5 +435,138 @@ func TestTusUploaderNoMemoryRetention(t *testing.T) {
 	if retained > maxKept {
 		t.Fatalf("uploaded %d MiB but %d KiB is still retained after GC - more than the %d KiB allowance",
 			uploaded/(1024*1024), retained/1024, maxKept/1024)
+	}
+}
+
+// TestTusUploadCancelledContext checks that cancelling the context
+// while a PATCH is in flight stops the upload immediately instead of
+// retrying or querying the server offset.
+func TestTusUploadCancelledContext(t *testing.T) {
+	srv := newFakeTusServer()
+	defer srv.Close()
+	srv.blockRelease = make(chan struct{})
+	srv.patchArrived = make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(srv.blockRelease) })
+	defer unblock()
+
+	f := newTestTusFs(srv.srv.URL)
+	// Make retries after cancellation slow so this fails if the uploader
+	// ignores the cancelled context instead of stopping immediately.
+	f.pacer.SetRetries(100)
+	f.pacer.SetCalculator(pacer.NewDefault(
+		pacer.MinSleep(100*time.Millisecond),
+		pacer.MaxSleep(100*time.Millisecond),
+	))
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		o, src := newTestObject(f, 2048)
+		errCh <- o.updateViaTus(ctx, &nonSeekable{bytes.NewReader(make([]byte, 2048))}, "application/octet-stream", src)
+	}()
+
+	select {
+	case <-srv.patchArrived:
+	case err := <-errCh:
+		t.Fatalf("upload finished before the first PATCH was blocked: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the first PATCH to arrive")
+	}
+	cancel()
+	unblock()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the upload to stop")
+	}
+	if got := srv.patchCount(); got != 1 {
+		t.Fatalf("server received %d PATCH requests, want 1", got)
+	}
+}
+
+// TestTusUploadLostResponseNotAccepted checks that when every PATCH
+// attempt drops the connection before the server records the chunk, the
+// upload fails with the underlying transport error rather than
+// ErrOffsetMismatch.
+func TestTusUploadLostResponseNotAccepted(t *testing.T) {
+	srv := newFakeTusServer()
+	defer srv.Close()
+	srv.dropResponseBeforeAccept = 100
+	f := newTestTusFs(srv.srv.URL)
+	f.pacer.SetRetries(3)
+
+	err := uploadViaTus(t, f, make([]byte, 2048))
+	if err == nil {
+		t.Fatal("expected upload to fail when connection is always dropped")
+	}
+	if errors.Is(err, ErrOffsetMismatch) {
+		t.Fatalf("got %v, want underlying transport error instead of ErrOffsetMismatch", err)
+	}
+}
+
+// TestTusUploadPartialChunkAccepted checks that the uploader sends the
+// rest of a chunk which the server accepted only in part.
+//
+// The tus protocol allows the server to accept fewer bytes than were
+// offered in a PATCH and to report the new offset in the Upload-Offset
+// header of its 204 response. The client has to send the remaining
+// bytes starting at that offset, otherwise the file on the server is
+// truncated.
+//
+// The server here stores the first 512 KiB of the first chunk only and
+// reports that offset. The uploader has to send the remaining 512 KiB,
+// so the server sees two PATCH requests for the first chunk.
+func TestTusUploadPartialChunkAccepted(t *testing.T) {
+	srv := newFakeTusServer()
+	defer srv.Close()
+	srv.acceptPrefix = 512 * 1024
+	f := newTestTusFs(srv.srv.URL)
+
+	data := make([]byte, 2*1024*1024)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := uploadViaTus(t, f, data); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.received("/tus/upload-1"); !bytes.Equal(got, data) {
+		t.Fatalf("uploaded %d bytes, want %d bytes, content mismatch", len(got), len(data))
+	}
+	// The first chunk is sent twice, once with all of it and once with
+	// the part the server did not accept, the second chunk is sent once.
+	if got := srv.patchCount(); got != 3 {
+		t.Fatalf("server received %d PATCH requests, want 3", got)
+	}
+}
+
+// TestTusUploadReplaysBodyOnRedirect checks that the body of a chunk can
+// be sent again when the server redirects the request.
+//
+// The HTTP client of Go can only repeat the body of a request if the
+// request has a GetBody function, otherwise it refuses to follow a 307
+// or a 308 redirect, and the same is true when an HTTP/2 server asks
+// for the request to be repeated on another connection. The uploader has
+// to provide GetBody for the chunk it sends.
+//
+// The server here answers the first PATCH with a 307 to the same URL.
+// The upload has to complete and the data has to arrive intact.
+func TestTusUploadReplaysBodyOnRedirect(t *testing.T) {
+	srv := newFakeTusServer()
+	defer srv.Close()
+	srv.redirectFirstPatch = true
+	f := newTestTusFs(srv.srv.URL)
+
+	data := make([]byte, 2*1024*1024)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := uploadViaTus(t, f, data); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.received("/tus/upload-1"); !bytes.Equal(got, data) {
+		t.Fatalf("uploaded %d bytes, want %d bytes, content mismatch", len(got), len(data))
 	}
 }
