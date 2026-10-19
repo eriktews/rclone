@@ -17,35 +17,8 @@ type Upload struct {
 	// resuming a previous upload is not implemented.
 	stream io.Reader
 	size   int64
-	offset int64
 
-	Fingerprint string
-	Metadata    Metadata
-}
-
-// Updates the Upload information based on offset.
-func (u *Upload) updateProgress(offset int64) {
-	u.offset = offset
-}
-
-// Finished returns whether this upload is finished or not.
-func (u *Upload) Finished() bool {
-	return u.offset >= u.size
-}
-
-// Progress returns the progress in a percentage.
-func (u *Upload) Progress() int64 {
-	return (u.offset * 100) / u.size
-}
-
-// Offset returns the current upload offset.
-func (u *Upload) Offset() int64 {
-	return u.offset
-}
-
-// Size returns the size of the upload body.
-func (u *Upload) Size() int64 {
-	return u.size
+	Metadata Metadata
 }
 
 // EncodedMetadata encodes the upload metadata.
@@ -67,7 +40,7 @@ func b64encode(s string) string {
 //
 // The reader is consumed sequentially in chunk sized pieces, so it does
 // not need to implement io.Seeker.
-func NewUpload(reader io.Reader, size int64, metadata Metadata, fingerprint string) *Upload {
+func NewUpload(reader io.Reader, size int64, metadata Metadata) *Upload {
 	if metadata == nil {
 		metadata = make(Metadata)
 	}
@@ -76,7 +49,6 @@ func NewUpload(reader io.Reader, size int64, metadata Metadata, fingerprint stri
 		stream: reader,
 		size:   size,
 
-		Fingerprint: fingerprint,
-		Metadata:    metadata,
+		Metadata: metadata,
 	}
 }

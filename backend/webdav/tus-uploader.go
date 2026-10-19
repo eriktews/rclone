@@ -16,20 +16,11 @@ import (
 
 // Uploader holds all information about a currently running upload
 type Uploader struct {
-	fs                  *Fs
-	url                 string
-	upload              *Upload
-	offset              int64
-	aborted             bool
-	uploadSubs          []chan Upload
-	notifyChan          chan bool
-	overridePatchMethod bool
-	buf                 []byte
-}
-
-// NotifyUploadProgress subscribes to progress updates.
-func (u *Uploader) NotifyUploadProgress(c chan Upload) {
-	u.uploadSubs = append(u.uploadSubs, c)
+	fs     *Fs
+	url    string
+	upload *Upload
+	offset int64
+	buf    []byte
 }
 
 func (f *Fs) shouldRetryChunk(ctx context.Context, resp *http.Response, err error, newOff *int64) (bool, error) {
@@ -76,26 +67,15 @@ func canRecoverViaHead(resp *http.Response, retry bool) bool {
 }
 
 func (u *Uploader) uploadChunk(ctx context.Context, data []byte, offset int64, options ...fs.OpenOption) (int64, error) {
-	var method string
-
-	if !u.overridePatchMethod {
-		method = "PATCH"
-	} else {
-		method = "POST"
-	}
-
 	extraHeaders := map[string]string{} // FIXME: Use extraHeaders(ctx, src) from Object maybe?
 	extraHeaders["Tus-Resumable"] = "1.0.0"
 	extraHeaders["filetype"] = u.upload.Metadata["filetype"]
-	if u.overridePatchMethod {
-		extraHeaders["X-HTTP-Method-Override"] = "PATCH"
-	}
 
 	wantOffset := offset + int64(len(data))
 	curOffset := offset
 	var size int64
 	opts := rest.Opts{
-		Method:        method,
+		Method:        "PATCH",
 		RootURL:       u.url,
 		NoResponse:    true,
 		ContentLength: &size,
@@ -206,15 +186,10 @@ func (u *Uploader) serverOffset(ctx context.Context, options ...fs.OpenOption) (
 
 // Upload uploads the entire body to the server.
 func (u *Uploader) Upload(ctx context.Context, options ...fs.OpenOption) error {
-	// Close the notification channel when the upload is finished so the
-	// broadcastProgress goroutine exits. Otherwise it would wait on this
-	// channel forever, retaining the Uploader and the uploaded data in
-	// memory.
-	defer close(u.notifyChan)
 	cnt := 1
 
 	fs.Debug(u.fs, "Uploaded starts")
-	for u.offset < u.upload.size && !u.aborted {
+	for u.offset < u.upload.size {
 		err := u.UploadChunk(ctx, cnt, options...)
 		cnt++
 		if err != nil {
@@ -267,35 +242,14 @@ func (u *Uploader) UploadChunk(ctx context.Context, cnt int, options ...fs.OpenO
 
 	u.offset = newOffset
 
-	u.upload.updateProgress(u.offset)
-
-	u.notifyChan <- true
-
 	return nil
 }
 
-// Waits for a signal to broadcast to all subscribers
-func (u *Uploader) broadcastProgress() {
-	for range u.notifyChan {
-		for _, c := range u.uploadSubs {
-			c <- *u.upload
-		}
-	}
-}
-
 // NewUploader creates a new Uploader.
-func NewUploader(f *Fs, url string, upload *Upload, offset int64) *Uploader {
-	notifyChan := make(chan bool)
-
-	uploader := &Uploader{
-		fs:         f,
-		url:        url,
-		upload:     upload,
-		offset:     offset,
-		notifyChan: notifyChan,
+func NewUploader(f *Fs, url string, upload *Upload) *Uploader {
+	return &Uploader{
+		fs:     f,
+		url:    url,
+		upload: upload,
 	}
-
-	go uploader.broadcastProgress()
-
-	return uploader
 }

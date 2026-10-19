@@ -28,11 +28,8 @@ func (o *Object) updateViaTus(ctx context.Context, in io.Reader, contentType str
 		"filetype": contentType,
 	}
 
-	// Fingerprint is used to identify the upload when resuming. That is not yet implemented
-	fingerprint := ""
-
 	// create an upload from a file.
-	upload := NewUpload(in, src.Size(), metadata, fingerprint)
+	upload := NewUpload(in, src.Size(), metadata)
 
 	// create the uploader.
 	uploader, err := o.CreateUploader(ctx, src, upload, options...)
@@ -78,10 +75,6 @@ func (o *Object) CreateUploader(ctx context.Context, src fs.ObjectInfo, u *Uploa
 	if u.size > 0 && o.fs.opt.ChunkSize <= 0 {
 		return nil, ErrChunkSize
 	}
-
-	// if c.Config.Resume && len(u.Fingerprint) == 0 {
-	//		return nil, ErrFingerprintNotSet
-	//	}
 
 	l := int64(0)
 	p := o.filePath()
@@ -148,7 +141,7 @@ func (o *Object) CreateUploader(ctx context.Context, src fs.ObjectInfo, u *Uploa
 	}
 	tusLocation = resolved.String()
 
-	uploader := NewUploader(o.fs, tusLocation, u, 0)
+	uploader := NewUploader(o.fs, tusLocation, u)
 
 	return uploader, nil
 }
